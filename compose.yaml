@@ -1,0 +1,12 @@
+services:
+  asterisk:
+    image: andrius/asterisk@sha256:e92c2cfff90038b4c6669592ce8baea019b03f381ec231a182249a96fdb18cfd
+    restart: "no"
+    ports:
+      - "127.0.0.1:8088:8088/tcp"
+      - "5060:5060/tcp"
+      - "10000-10020:10000-10020/udp"
+    volumes:
+      - ./runtime/asterisk:/etc/asterisk:ro
+      - ./recordings:/var/spool/asterisk/recording
+    command: ["asterisk", "-f", "-vvv", "-g", "-U", "asterisk"]

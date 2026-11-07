@@ -1,0 +1,37 @@
+{
+  "name": "allo-gpt",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A local Ink console for GPT-Live phone calls through Plusofon and Asterisk",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "prestart": "npm run build",
+    "start": "node dist/cli.js",
+    "dev": "tsx src/cli.tsx",
+    "demo": "npm run build && node dist/cli.js --demo",
+    "doctor": "npm run build && node dist/cli.js --doctor",
+    "test": "tsx --test test/*.test.ts test/*.test.tsx",
+    "check": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "setup:asterisk": "npm run build && node dist/setup-asterisk.js",
+    "check:gateway": "npm run build && node dist/check-gateway.js"
+  },
+  "dependencies": {
+    "ink": "8.0.0",
+    "ink-text-input": "6.0.0",
+    "react": "19.3.1",
+    "ws": "8.22.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/ws": "^8.5.0",
+    "esbuild": "0.28.2",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "4.23.15",
+    "typescript": "7.1.0-beta"
+  }
+}
