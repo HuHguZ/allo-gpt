@@ -203,6 +203,10 @@ test('config generation uses a strict dialplan and rejects config/host/credentia
   assert.match(files['extensions.conf']!, /b\(gpt-charge\^s\^1\)/);
   assert.match(files['extensions.conf']!, /PJSIP_HEADER\(add,P-Charge-Info\)/);
   assert.match(files['extensions.conf']!, /<sip:79990000000@voice\.plusofon\.ru>/);
+  for(const entry of ['_X.','s'])assert.ok(files['extensions.conf']!.includes(`exten => ${entry},1,Set(JITTERBUFFER(fixed)=120)\n same => n,Stasis(gpt-live-phone,incoming)`));
+  assert.match(files['extensions.conf']!, /\[gpt-charge\]\nexten => s,1,Set\(JITTERBUFFER\(fixed\)=120\)\n same => n,Set\(PJSIP_HEADER/);
+  assert.equal((renderAsteriskConfig({...env,ASTERISK_JITTERBUFFER_MS:'80'})['extensions.conf']!.match(/JITTERBUFFER\(fixed\)=80/g)||[]).length,3);
+  for(const size of ['0','-20','NaN','41','500','120\n[bad]'])assert.throws(()=>renderAsteriskConfig({...env,ASTERISK_JITTERBUFFER_MS:size}),/ASTERISK_JITTERBUFFER_MS/);
   assert.match(files['rtp.conf']!, /rtpend=10020/);
   assert.match(files['http.conf']!, /bindaddr=127\.0\.0\.1/);
   assert.match(files['modules.conf']!, /chan_websocket\.so/);

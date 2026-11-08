@@ -13,7 +13,7 @@
     "dev": "tsx src/cli.tsx",
     "demo": "npm run build && node dist/cli.js --demo",
     "doctor": "npm run build && node dist/cli.js --doctor",
-    "test": "tsx --test test/*.test.ts test/*.test.tsx",
+    "test": "node scripts/test.mjs",
     "check": "tsc --noEmit",
     "build": "node scripts/build.mjs",
     "setup:asterisk": "npm run build && node dist/setup-asterisk.js",

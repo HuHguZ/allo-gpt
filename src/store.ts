@@ -1,5 +1,5 @@
-import {mkdir, readFile, readdir, rename, writeFile} from 'node:fs/promises';
-import {join} from 'node:path';
+import {mkdir, readFile, readdir, rename, writeFile, lstat, realpath, unlink, rm} from 'node:fs/promises';
+import {join, resolve, dirname, basename} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import {safeText} from './config.js';
 import type {CallRecord, TranscriptEntry} from './types.js';
@@ -25,8 +25,9 @@ export function transcriptText(record: CallRecord): string {
 
 export class CallStore {
   private queue: Promise<unknown> = Promise.resolve();
+  private deleted=new Set<string>();
   readonly warnings: string[] = [];
-  constructor(readonly root: string) {}
+  constructor(readonly root: string,readonly recordingsRoot=resolve('recordings')) {}
   directory(id: string): string {
     if (!/^[a-zA-Z0-9_-]{1,100}$/.test(id)) throw new Error('Некорректный ID звонка.');
     return join(this.root,id);
@@ -50,6 +51,7 @@ export class CallStore {
     const snapshot=structuredClone(record);
     const directory=this.directory(record.id);
     const operation=this.queue.catch(()=>{}).then(async()=>{
+      if(this.deleted.has(snapshot.id))throw new Error('Звонок уже удалён.');
       await mkdir(directory,{recursive:true});
       const text=transcriptText(snapshot);
       for (const [name,contents] of [['call.json',JSON.stringify(snapshot,null,2)+'\n'],['transcript.txt',text],['transcript.md',`# Транскрипт\n\n\`\`\`text\n${text.replace(/`/g,'ʼ')}\`\`\`\n`]]) {
@@ -61,6 +63,42 @@ export class CallStore {
     });
     this.queue=operation;
     return operation;
+  }
+  remove(record:Pick<CallRecord,'id'|'recordingPath'>):Promise<void>{
+    const id=record.id,directory=resolve(this.directory(id)),recording=record.recordingPath?resolve(record.recordingPath):undefined;
+    const operation=this.queue.catch(()=>{}).then(async()=>{
+      let hasDirectory=false,hasRecording=false;
+      // Validate both targets before deleting either; saved JSON is not a trusted path source.
+      try{
+        const info=await lstat(directory);
+        if(!info.isDirectory()||info.isSymbolicLink()||dirname(await realpath(directory))!==await realpath(this.root))throw new Error('Недопустимый путь каталога звонка.');
+        hasDirectory=true;
+      }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+      if(recording){
+        if(dirname(recording)!==resolve(this.recordingsRoot)||!/^[a-f0-9-]{36}\.wav$/i.test(basename(recording)))throw new Error('Недопустимый путь аудиозаписи.');
+        try{
+          const info=await lstat(recording);
+          if(!info.isFile()||info.isSymbolicLink()||dirname(await realpath(recording))!==await realpath(this.recordingsRoot))throw new Error('Недопустимый путь аудиозаписи.');
+          hasRecording=true;
+        }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+      }
+      if(hasRecording)await unlink(recording!);
+      if(hasDirectory)await rm(directory,{recursive:true,force:true});
+      this.deleted.add(id);
+    });
+    this.queue=operation.catch(()=>{});return operation;
+  }
+  async clearOrphans():Promise<void>{
+    await this.queue.catch(()=>{});
+    const missing=(error:NodeJS.ErrnoException)=>{if(error.code==='ENOENT')return [];throw error;};
+    const directories=await readdir(this.root,{withFileTypes:true}).catch(missing);
+    const recordings=await readdir(this.recordingsRoot,{withFileTypes:true}).catch(missing);
+    const artifacts=new Map<string,string|undefined>();
+    const uuid=/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+    for(const entry of directories)if(uuid.test(entry.name))artifacts.set(entry.name,undefined);
+    // Failed media setup can leave a bridge UUID WAV without a call.json link.
+    for(const entry of recordings)if(entry.name.toLowerCase().endsWith('.wav')&&uuid.test(entry.name.slice(0,-4)))artifacts.set(entry.name.slice(0,-4),resolve(this.recordingsRoot,entry.name));
+    for(const [id,recordingPath] of artifacts)await this.remove({id,recordingPath});
   }
   async flush(): Promise<void> { await this.queue; }
 }

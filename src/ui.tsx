@@ -2,7 +2,7 @@ import React, {useEffect, useRef, useState} from 'react';
 import {Box, Text, measureElement, useBoxMetrics, useApp, useInput, useStdin, useWindowSize, type DOMElement} from 'ink';
 import TextInput from 'ink-text-input';
 import type {CallRecord, Check, ConsoleController} from './types.js';
-import {useMouse, type MouseTargets} from './mouse.js';
+import {useMouse, type MouseTargets,type MouseDrag} from './mouse.js';
 
 const teal = '#55D6BE';
 const amber = '#F2BD62';
@@ -22,8 +22,9 @@ const time = (date: string) => {
   return Number.isNaN(value.getTime()) ? '—' : value.toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
 };
 
-function Button({children, focused, disabled = false, elementRef}: {children: React.ReactNode; focused: boolean; disabled?: boolean; elementRef?: (node: DOMElement | null) => void}) {
-  return <Box ref={elementRef} flexShrink={0} aria-role="button" aria-state={{disabled}}><Text color={disabled ? 'gray' : focused ? 'black' : teal} backgroundColor={focused && !disabled ? teal : undefined} bold={focused}> {focused ? '›' : ' '} {children} </Text></Box>;
+function Button({children, focused, disabled = false, danger=false, elementRef}: {children: React.ReactNode; focused: boolean; disabled?: boolean; danger?:boolean; elementRef?: (node: DOMElement | null) => void}) {
+  const color=danger?'red':teal;
+  return <Box ref={elementRef} flexShrink={0} aria-role="button" aria-state={{disabled}}><Text color={disabled ? 'gray' : focused ? danger?'white':'black' : color} backgroundColor={focused && !disabled ? color : undefined} bold={focused}> {focused ? '›' : ' '} {children} </Text></Box>;
 }
 
 function Transcript({call}: {call: CallRecord}) {
@@ -50,14 +51,21 @@ export function App({controller}: {controller: ConsoleController}) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
   const [cancelling, setCancelling] = useState(false);
+  const [deletion,setDeletion]=useState<{id?:string;number?:string}|null>(null);
+  const [confirmFocused,setConfirmFocused]=useState(false);
+  const [playerDialog,setPlayerDialog]=useState<CallRecord|null>(null);
+  const [playerFocus,setPlayerFocus]=useState(1);
   const working = useRef(false);
   const stopping = useRef(false);
   const closing = useRef(false);
   const root = useRef<DOMElement>(null);
   const viewport=useRef<DOMElement>(null),content=useRef<DOMElement>(null),scrollArea=useRef<DOMElement>(null);
+  const scrollDrag=useRef<{y:number;offset:number;moved:boolean}|null>(null);
   const viewportMetrics=useBoxMetrics(viewport),contentMetrics=useBoxMetrics(content);
   const targets = useRef<MouseTargets>(new Map());
-  useMouse(root, targets, () => commandMode(true),(direction,x,y)=>{
+  const playerTrack=useRef<DOMElement>(null);
+  useMouse(root, targets, () => {if(playerDialog)closeAudio();else if(deletion){if(!busy)setDeletion(null);}else commandMode(true);},(direction,x,y)=>{
+    if(deletion||playerDialog)return;
     if(!scrollArea.current)return;const box=measureElement(scrollArea.current);
     if(x>=box.x&&x<box.x+box.width&&y>=box.y&&y<box.y+box.height)scrollBy(direction*3);
   });
@@ -75,12 +83,20 @@ export function App({controller}: {controller: ConsoleController}) {
   const thumbHeight=Math.min(trackHeight,Math.max(1,Math.round(trackHeight*trackHeight/Math.max(1,contentMetrics.height))));
   const thumbTop=maxOffset?Math.round((trackHeight-thumbHeight)*scrollTop/maxOffset):0;
   const scrollPercent=maxOffset?Math.round(scrollTop/maxOffset*100):100;
-  const canStart = Boolean(number.trim() && task.trim() && !active && !busy && !cancelling);
+  const playback=snapshot.playback?.id===playerDialog?.id?snapshot.playback:undefined;
+  const playerPosition=playback?.positionSeconds??0,playerDuration=playback?.durationSeconds??0;
+  const playerWidth=Math.max(8,Math.min(56,width-14)),playerMarker=Math.round((playerWidth-1)*playerPosition/Math.max(1,playerDuration));
+  const canStart = Boolean(number.trim() && !active && !busy && !cancelling);
 
   function scrollBy(lines:number){setOffset(previous=>{
     const next=Math.max(0,Math.min(maxOffset,(previous===null?maxOffset:Math.min(previous,maxOffset))+lines));
     return next===maxOffset?null:next;
   });}
+  function jumpScroll(y:number):number{
+    if(!scrollArea.current)return scrollTop;
+    const row=Math.max(0,Math.min(trackHeight-1,y-measureElement(scrollArea.current).y));
+    const next=Math.round(maxOffset*row/Math.max(1,trackHeight-1));setOffset(next===maxOffset?null:next);return next;
+  }
 
   function commandMode(value: boolean) {
     commandsRef.current = value;
@@ -99,8 +115,11 @@ export function App({controller}: {controller: ConsoleController}) {
       setView('call');
       setField('instruction');
       setOffset(null);
+      setDeletion(null);
+      setPlayerDialog(null);
     }
   }, [snapshot.current?.id]);
+  useEffect(()=>{setSelection(value=>Math.min(value,Math.max(0,snapshot.history.length-1)));},[snapshot.history.length]);
 
   async function run(label: string, action: () => Promise<void>) {
     if (working.current || stopping.current || closing.current) return;
@@ -134,10 +153,10 @@ export function App({controller}: {controller: ConsoleController}) {
     }
   }
 
-  const show = (next: View) => {setView(next); setOffset(null);};
+  const show = (next: View) => {scrollDrag.current=null;setView(next); setOffset(null);};
   const focus = (name: Field) => {setField(name); commandMode(false);};
-  const target = (id: string, press: () => void) => (node: DOMElement | null) => {
-    if (node) targets.current.set(id, {node, press});
+  const target = (id: string, press: (x:number,y:number) => void,drag?:MouseDrag) => (node: DOMElement | null) => {
+    if (node&&(!deletion||id.startsWith('dialog-'))&&(!playerDialog||id.startsWith('player-'))) targets.current.set(id, {node, press,drag});
     else targets.current.delete(id);
   };
   const navigate = (next: View) => {
@@ -156,13 +175,50 @@ export function App({controller}: {controller: ConsoleController}) {
       setInstruction('');
     });
   };
+  const askDelete=(all=false)=>{
+    if(active||busy||cancelling||(!all&&(!selected||!snapshot.history.length)))return;
+    commandMode(true);setConfirmFocused(false);setError('');
+    setDeletion(all?{}:{id:selected!.id,number:selected!.number});
+  };
+  const confirmDelete=()=>{
+    if(!deletion)return;
+    void run('Удаляем файлы…',async()=>{await controller.deleteHistory(deletion.id);setDeletion(null);setOffset(null);});
+  };
+  const stopAudio=()=>{void controller.stopRecording().catch(cause=>setError(cause instanceof Error?cause.message:String(cause)));};
+  const closeAudio=()=>{setPlayerDialog(null);stopAudio();};
+  const openAudio=(call:CallRecord)=>{
+    commandMode(true);setPlayerFocus(1);setPlayerDialog(call);setError('');
+    if(snapshot.playback?.id!==call.id)void run('Включаем запись…',()=>controller.playRecording(call.id));
+  };
+  const seekAudio=(position:number)=>{void run('Перематываем…',()=>controller.seekRecording(position));};
+  const toggleAudio=()=>{
+    if(!playerDialog||!playback)return;
+    void run('Плеер…',()=>playback.paused?controller.playRecording(playerDialog.id,playerPosition>=playerDuration?0:playerPosition):controller.pauseRecording());
+  };
 
   useInput((input, key) => {
     const commands = commandsRef.current;
+    if (key.ctrl && input === 'c') {void quit(); return;}
+    if(playerDialog){
+      if(key.escape||input==='a'){closeAudio();return;}
+      if(busy)return;
+      if(key.tab){setPlayerFocus(value=>(value+(key.shift?3:1))%4);return;}
+      if(key.leftArrow||key.rightArrow){seekAudio(playerPosition+(key.rightArrow?10:-10));return;}
+      if(key.home){seekAudio(0);return;}if(key.end){seekAudio(playerDuration);return;}
+      if(input===' '){toggleAudio();return;}
+      if(key.return){if(playerFocus===0)seekAudio(playerPosition-10);else if(playerFocus===1)toggleAudio();else if(playerFocus===2)seekAudio(playerPosition+10);else closeAudio();}
+      return;
+    }
+    if(deletion){
+      if(busy)return;
+      if(key.escape){setDeletion(null);return;}
+      if(key.tab||key.leftArrow||key.rightArrow){setConfirmFocused(value=>!value);return;}
+      if(key.return){if(confirmFocused)confirmDelete();else setDeletion(null);}
+      return;
+    }
     if(key.ctrl&&(key.leftArrow||key.rightArrow)){
       const views:View[]=['compose','call','history','doctor'];navigate(views[(views.indexOf(view)+(key.rightArrow?1:3))%4]!);return;
     }
-    if (key.ctrl && input === 'c') {void quit(); return;}
     if (key.escape) {commandMode(true); return;}
     if(scrollingView&&selected){
       if(key.pageUp||key.pageDown){scrollBy((key.pageDown?1:-1)*Math.max(1,viewportMetrics.clientHeight-1));return;}
@@ -204,7 +260,8 @@ export function App({controller}: {controller: ConsoleController}) {
     if (input === 'm') void run('Меняем режим…', () => controller.setMode(snapshot.mode === 'demo' ? 'live' : 'demo'));
     if (input === 's' && selected) void run('Готовим итог…', () => controller.summarize(selected.id));
     if (input === 't' && selected) void run('Отправляем транскрипт…', () => controller.sendTranscript(selected.id));
-    if (input === 'a' && selected && !isOngoing(selected)) void run('Открываем запись…', () => controller.playRecording(selected.id));
+    if(input==='a'&&selected?.recordingPath&&!isOngoing(selected)&&!active)openAudio(selected);
+    if(view==='history'&&key.delete)askDelete(key.shift);
   }, {isActive: isRawModeSupported});
 
   const input = (name: Field, value: string, onChange: (value: string) => void, placeholder: string) => (
@@ -224,12 +281,21 @@ export function App({controller}: {controller: ConsoleController}) {
     {selected.savedPath && <Text dimColor wrap="truncate-end">Сохранено: {clean(selected.savedPath)}</Text>}
     </Box>
     </Box>
-    <Box flexDirection="column" flexShrink={0} width={1} marginLeft={1} height={trackHeight} aria-label={`Прокрутка диалога: ${scrollPercent}%`}>
+    <Box flexDirection="column" flexShrink={0} width={3} height={trackHeight} aria-label={`Прокрутка диалога: ${scrollPercent}%`} ref={target('scrollbar',(_x,y)=>{
+      if(!scrollArea.current||!maxOffset)return;
+      const row=y-measureElement(scrollArea.current).y;
+      scrollDrag.current={y,offset:scrollTop,moved:false};
+      if(row<thumbTop||row>=thumbTop+thumbHeight)scrollDrag.current.offset=jumpScroll(y);
+    },(phase,_x,y)=>{
+      const drag=scrollDrag.current;if(!drag)return;
+      if(phase==='end'){if(!drag.moved)jumpScroll(y);scrollDrag.current=null;return;}
+      drag.moved=true;
+      const next=Math.max(0,Math.min(maxOffset,Math.round(drag.offset+(y-drag.y)*maxOffset/Math.max(1,trackHeight-thumbHeight))));
+      setOffset(next===maxOffset?null:next);
+    })}>
       {maxOffset>0&&Array.from({length:trackHeight},(_,row)=>{
         const thumb=row>=thumbTop&&row<thumbTop+thumbHeight;
-        return <Box key={row} height={1} flexShrink={0} ref={target(`scrollbar-${row}`,()=>{
-          if(thumb)return;const next=Math.round(maxOffset*row/Math.max(1,trackHeight-1));setOffset(next===maxOffset?null:next);
-        })}><Text color={thumb?teal:'gray'}>{thumb?'█':'░'}</Text></Box>;
+        return <Box key={row} height={1} flexShrink={0}><Text color={thumb?teal:'gray'}>{thumb?' █ ':' ░ '}</Text></Box>;
       })}
     </Box>
     </Box>
@@ -240,11 +306,12 @@ export function App({controller}: {controller: ConsoleController}) {
     <Box gap={1} flexShrink={0}>
       <Button elementRef={target('summary', () => {void run('Готовим итог…', () => controller.summarize(selected.id));})} focused={false} disabled={Boolean(busy) || cancelling}>s ИТОГ</Button>
       <Button elementRef={target('transcript', () => {void run('Отправляем транскрипт…', () => controller.sendTranscript(selected.id));})} focused={false} disabled={Boolean(busy) || cancelling}>t ТРАНСКРИПТ</Button>
-      {selected.recordingPath&&!isOngoing(selected)&&<Button elementRef={target('recording',()=>{void run('Открываем запись…',()=>controller.playRecording(selected.id));})} focused={false} disabled={Boolean(busy)||cancelling}>a ЗАПИСЬ</Button>}
+      {selected.recordingPath&&!isOngoing(selected)&&<Button elementRef={target('recording',()=>{if(!busy&&!cancelling&&!active)openAudio(selected);})} focused={false} disabled={Boolean(busy)||cancelling||active}>a СЛУШАТЬ</Button>}
     </Box>
   </Box> : <Text dimColor>Звонков пока нет. Нажмите Esc → n, чтобы начать.</Text>;
 
   return <Box ref={root} width={width} height={scrollingView?(rows||24):undefined} minHeight={rows || 24} flexDirection="column" paddingX={1}>
+    <Box flexDirection="column" flexGrow={1} minHeight={0} aria-hidden={Boolean(deletion)}>
     <Box flexDirection="column" flexShrink={0}>
     <Box justifyContent="space-between">
       <Text bold color={teal}>◉ GPT-LIVE <Text color="white">/ PHONE</Text></Text>
@@ -265,6 +332,15 @@ export function App({controller}: {controller: ConsoleController}) {
       {([['compose', '1 НОВЫЙ'], ['call', '2 ЭФИР'], ['history', '3 ИСТОРИЯ'], ['doctor', '4 ПРОВЕРКА']] as const).map(([name, label]) => <Box key={name} ref={target(`tab-${name}`, () => navigate(name))} flexShrink={0} aria-role="tab" aria-state={{selected: view === name}}><Text color={view === name ? teal : 'gray'} bold={view === name}>{view === name ? '▸ ' : ''}{label}</Text></Box>)}
     </Box>
     </Box>
+    {snapshot.playback&&<Box gap={2} flexShrink={0} flexWrap="wrap">
+      <Button elementRef={target('open-player',()=>{const call=snapshot.history.find(call=>call.id===snapshot.playback?.id);if(call)openAudio(call);})} focused={false}>{snapshot.playback.paused?'Ⅱ ПАУЗА':'▶ СЛУШАЕМ'} {clean(snapshot.history.find(call=>call.id===snapshot.playback?.id)?.number||'запись')}</Button>
+      <Button elementRef={target('stop-audio',stopAudio)} focused={false}>■ СТОП</Button>
+    </Box>}
+    {view==='history'&&<Box gap={2} flexWrap="wrap" flexShrink={0} marginTop={1}>
+      <Button elementRef={target('delete-selected',()=>askDelete())} focused={false} danger disabled={active||Boolean(busy)||!selected}>УДАЛИТЬ ЗВОНОК</Button>
+      <Button elementRef={target('delete-all',()=>askDelete(true))} focused={false} danger disabled={active||Boolean(busy)}>ОЧИСТИТЬ ИСТОРИЮ</Button>
+      <Text dimColor>{active?'После завершения звонка':'Del · Shift+Del всё'}</Text>
+    </Box>}
     <Box borderStyle="single" borderColor="gray" flexDirection="column" paddingX={1} marginTop={1} flexGrow={scrollingView?1:0} flexShrink={scrollingView?1:0} minHeight={scrollingView?3:undefined}>
       <Box flexShrink={0}><Text><Text color={snapshot.gatewayStatus === 'ready' ? teal : amber}>● </Text>ШЛЮЗ · {{disabled: 'отключён', connecting: 'подключение', ready: 'готов / ждём входящий', error: 'ошибка'}[snapshot.gatewayStatus]}{active && <Text color={teal}>   ● {statusNames[snapshot.current!.status]}</Text>}</Text></Box>
       {view === 'compose' && <Box flexDirection={wide ? 'row' : 'column'} marginTop={1} gap={wide ? 4 : 1}>
@@ -273,8 +349,8 @@ export function App({controller}: {controller: ConsoleController}) {
           <Text dimColor>Номер · международный формат</Text>
           <Box ref={target('number', () => focus('number'))} aria-role="textbox"><Text color={field === 'number' && !commands ? teal : 'gray'}>› </Text>{input('number', number, setNumber, '+79991234567')}</Box>
           <Box marginTop={1} flexDirection="column">
-            <Text dimColor>Задача и поведение агента</Text>
-            <Box ref={target('task', () => focus('task'))} aria-role="textbox"><Text color={field === 'task' && !commands ? teal : 'gray'}>› </Text>{input('task', task, setTask, 'Что узнать или сделать во время звонка?')}</Box>
+            <Text dimColor>Задача и поведение агента · необязательно</Text>
+            <Box ref={target('task', () => focus('task'))} aria-role="textbox"><Text color={field === 'task' && !commands ? teal : 'gray'}>› </Text>{input('task', task, setTask, 'Можно оставить пустым — обычный разговор')}</Box>
           </Box>
           <Box marginTop={1}><Button elementRef={target('start', () => {focus('start'); start();})} focused={!commands && field === 'start'} disabled={!canStart}>ПОЗВОНИТЬ</Button></Box>
           <Text dimColor>Tab → кнопка · Enter → звонок</Text>
@@ -321,5 +397,43 @@ export function App({controller}: {controller: ConsoleController}) {
     <Text dimColor>{scrollingView?'Колесо / PgUp PgDn · Ctrl+Home начало · Ctrl+End конец':commands?'x завершить · s итог · t транскрипт · a запись · q выход':'Esc → q выход · Ctrl+C закрыть соединения и выйти'}</Text>
     {!isRawModeSupported && <Text color={amber}>Нет интерактивного ввода. Запустите npm start в обычном терминале.</Text>}
     </Box>
+    </Box>
+    {deletion&&<Box position="absolute" top={0} left={-1} width={width} height={rows||24} alignItems="center" justifyContent="center" backgroundColor="#090d10">
+      <Box flexDirection="column" width={Math.min(76,width-4)} borderStyle="double" borderColor={amber} backgroundColor="#151c22" paddingX={2} paddingY={1} gap={1} aria-label="Подтверждение удаления истории">
+        <Text color={teal} bold>GPT-LIVE / ИСТОРИЯ</Text>
+        <Text color={amber} bold>{deletion.id?'УДАЛИТЬ ВЫБРАННЫЙ ЗВОНОК?':'ОЧИСТИТЬ ВСЮ ИСТОРИЮ?'}</Text>
+        <Text>{deletion.id?`Звонок: ${clean(deletion.number||'')}`:`Звонков в истории: ${snapshot.history.length}`}</Text>
+        <Text>Будут удалены WAV, JSON, транскрипты и метаданные.</Text>
+        {!deletion.id&&<Text dimColor>Также служебные остатки прерванных звонков.</Text>}
+        <Text color={amber}>Без корзины. Восстановить файлы будет нельзя.</Text>
+        {error&&<Text color="red">{clean(error)}</Text>}
+        {busy?<Text color={amber}>{busy}</Text>:<Box gap={3} flexWrap="wrap">
+          <Button elementRef={target('dialog-cancel',()=>setDeletion(null))} focused={!confirmFocused}>ОТМЕНА</Button>
+          <Button elementRef={target('dialog-confirm',confirmDelete)} focused={confirmFocused} danger>УДАЛИТЬ НАВСЕГДА</Button>
+        </Box>}
+        <Text dimColor>Tab / ← → выбор · Enter подтвердить · Esc отмена</Text>
+      </Box>
+    </Box>}
+    {playerDialog&&<Box position="absolute" top={0} left={-1} width={width} height={rows||24} alignItems="center" justifyContent="center" backgroundColor="#090d10">
+      <Box flexDirection="column" width={Math.min(78,width-4)} borderStyle="double" borderColor={teal} backgroundColor="#151c22" paddingX={2} paddingY={1} gap={1} aria-label="Плеер записи разговора">
+        <Text color={teal} bold>GPT-LIVE / ПЛЕЕР</Text>
+        <Text wrap="truncate-end">{clean(playerDialog.number)} · {time(playerDialog.startedAt)}</Text>
+        <Text color={amber} wrap="truncate-end">{stamp(playerPosition*1000)} / {stamp(playerDuration*1000)} · {playback?.paused?'ПАУЗА':'ВОСПРОИЗВЕДЕНИЕ'}</Text>
+        <Box ref={node=>{playerTrack.current=node;target('player-timeline',x=>{
+          if(!busy&&playerTrack.current){const box=measureElement(playerTrack.current);seekAudio(Math.max(0,Math.min(1,(x-box.x)/Math.max(1,box.width-1)))*playerDuration);}
+        })(node);}} width={playerWidth} height={1} aria-label="Перемотка записи">
+          <Text color={teal}>{'━'.repeat(playerMarker)}●{'─'.repeat(playerWidth-playerMarker-1)}</Text>
+        </Box>
+        <Box gap={1} flexWrap="wrap">
+          <Button elementRef={target('player-back',()=>{if(!busy)seekAudio(playerPosition-10);})} focused={playerFocus===0}>−10 сек</Button>
+          <Box width={16} flexShrink={0}><Button elementRef={target('player-pause',()=>{if(!busy)toggleAudio();})} focused={playerFocus===1}>{playback?.paused?'ПРОДОЛЖИТЬ':'ПАУЗА'}</Button></Box>
+          <Button elementRef={target('player-forward',()=>{if(!busy)seekAudio(playerPosition+10);})} focused={playerFocus===2}>+10 сек</Button>
+          <Button elementRef={target('player-close',closeAudio)} focused={playerFocus===3}>■ СТОП</Button>
+        </Box>
+        <Box height={1} flexShrink={0}><Text color={error?'red':amber} wrap="truncate-end">{error?clean(error):busy||' '}</Text></Box>
+        <Text dimColor>Пробел пауза · ← → 10 сек · Home / End · клик по шкале</Text>
+        <Text dimColor>Tab выбор · Enter нажать · Esc остановить и закрыть</Text>
+      </Box>
+    </Box>}
   </Box>;
 }

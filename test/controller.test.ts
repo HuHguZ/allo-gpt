@@ -7,6 +7,22 @@ import {EventEmitter} from 'node:events';
 import {PhoneController} from '../src/controller.js';
 import {loadConfig} from '../src/config.js';
 
+for(const limit of [0,10])test(`call duration limit ${limit===0?'disabled':'enabled'} behaves explicitly`,async t=>{
+  const dir=await mkdtemp(join(tmpdir(),'phone-duration-'));
+  const leg={id:'duration-leg',async startMedia(){},sendAudio(){},async close(){}};
+  class Gateway extends EventEmitter{async connect(){this.emit('status','ready');}async dial(){return leg;}async close(){}}
+  class Voice extends EventEmitter{async connect(){}sendAudio(){}startConversation(){}instruct(){}async close(){return{confirmed:true};}}
+  t.mock.timers.enable({apis:['setTimeout']});
+  const app=new PhoneController(loadConfig({PHONE_MODE:'live',OPENAI_API_KEY:'test-key',ASTERISK_ARI_PASSWORD:'local-pass',PLUSOFON_CALLER_NUMBER:'+70000000000',CALLS_DIR:dir,MAX_CALL_SECONDS:String(limit)}),{gatewayFactory:()=>new Gateway(),liveFactory:()=>new Voice()});
+  try{
+    await app.initialize();await app.startCall('+70000000000');
+    t.mock.timers.tick(24*60*60*1000);
+    assert.equal(app.getSnapshot().current?.status,limit===0?'active':'ending');
+    await app.hangup();
+    if(limit)assert.equal(app.getSnapshot().history[0]?.hangupReason,'duration_limit');
+  }finally{await app.close();t.mock.timers.reset();await rm(dir,{recursive:true,force:true});}
+});
+
 test('demo makes no provider requests, rejects concurrent calls, and persists role-separated output', async () => {
   const dir=await mkdtemp(join(tmpdir(),'phone-demo-'));
   const app=new PhoneController(loadConfig({CALLS_DIR:dir}),{demoIntervalMs:5});
@@ -72,6 +88,24 @@ test('late transcript fragments are retained while OpenAI finalizes after hangup
   finally{await app.close();await rm(dir,{recursive:true,force:true});}
 });
 
+test('voice sessions receive the actual direction and peer number for both call paths', async()=>{
+  const dir=await mkdtemp(join(tmpdir(),'phone-context-'));
+  const leg={id:'outbound-leg',async startMedia(){},sendAudio(){},async close(){}};
+  class Gateway extends EventEmitter{async connect(){this.emit('status','ready');}async dial(){return leg;}async close(){}}
+  class Voice extends EventEmitter{async connect(){}sendAudio(){}startConversation(){}instruct(){}async close(){return{confirmed:true};}}
+  const gateway=new Gateway(),contexts:unknown[]=[];
+  const app=new PhoneController(loadConfig({PHONE_MODE:'live',OPENAI_API_KEY:'test-key',ASTERISK_ARI_PASSWORD:'local-pass',PLUSOFON_CALLER_NUMBER:'+70000000000',CALLS_DIR:dir}),{
+    gatewayFactory:()=>gateway,liveFactory:(_task,context)=>{contexts.push(context);return new Voice();},
+  });
+  try{
+    await app.initialize();await app.startCall('+70000000456','Обсуди выходные');await app.hangup();
+    gateway.emit('incoming',{...leg,id:'inbound-leg'},'8 (000) 000-01-23');
+    for(let i=0;i<100&&app.getSnapshot().current?.status!=='active';i++)await new Promise(r=>setTimeout(r,5));
+    assert.equal(app.getSnapshot().current?.status,'active');
+    assert.deepEqual(contexts,[{direction:'outbound',number:'+70000000456'},{direction:'inbound',number:'8 (000) 000-01-23'}]);
+  }finally{await app.close();await rm(dir,{recursive:true,force:true});}
+});
+
 test('cancellation waits for pending phone cleanup and records a cleanup failure', async () => {
   const dir=await mkdtemp(join(tmpdir(),'phone-cleanup-'));
   class SlowGateway extends EventEmitter {
@@ -105,9 +139,11 @@ test('a goodbye waits for the agent to stop speaking, then closes both connectio
   const app=new PhoneController(loadConfig({PHONE_MODE:'live',OPENAI_API_KEY:'test-key',ASTERISK_ARI_PASSWORD:'local-pass',PLUSOFON_CALLER_NUMBER:'+70000000000',CALLS_DIR:dir}),{gatewayFactory:()=>gateway,liveFactory:()=>voice});
   try{
     await app.initialize();await app.startCall('+70000000000','test');voice.emit('hangup-requested','caller_goodbye');gateway.emit('agent-speaking',leg.id,true);
+    voice.emit('notice','Разговор идёт. Реплики сохраняются локально.');assert.match(app.getSnapshot().notice,/прощается/);
     await new Promise(r=>setTimeout(r,50));assert.equal(phoneClosed,false);assert.equal(voiceClosed,false);
     gateway.emit('agent-speaking',leg.id,false);
     for(let n=0;n<100&&app.getSnapshot().current?.status!=='completed';n++)await new Promise(r=>setTimeout(r,20));
     assert.equal(phoneClosed,true);assert.equal(voiceClosed,true);assert.equal(app.getSnapshot().current?.status,'completed');assert.equal(app.getSnapshot().current?.hangupReason,'caller_goodbye');assert.equal(app.getSnapshot().current?.closeConfirmed,true);
+    assert.match(app.getSnapshot().notice,/собеседник попрощался/);const notice=app.getSnapshot().notice;voice.emit('notice','Агент ищет информацию в интернете…');assert.equal(app.getSnapshot().notice,notice);
   }finally{await app.close();await rm(dir,{recursive:true,force:true});}
 });

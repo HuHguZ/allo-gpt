@@ -41,6 +41,8 @@ export function renderAsteriskConfig(env: NodeJS.ProcessEnv): Record<string, str
   const httpBind = env.ASTERISK_HTTP_BIND_ADDRESS || '127.0.0.1';
   if (!['127.0.0.1', '0.0.0.0'].includes(httpBind)) throw new Error('ASTERISK_HTTP_BIND_ADDRESS must be 127.0.0.1 or 0.0.0.0');
   const external = host('ASTERISK_EXTERNAL_ADDRESS', true);
+  const jitterBufferMs=Number(env.ASTERISK_JITTERBUFFER_MS||'120');
+  if(!Number.isInteger(jitterBufferMs)||jitterBufferMs<40||jitterBufferMs>400||jitterBufferMs%20)throw new Error('ASTERISK_JITTERBUFFER_MS must be 40-400 milliseconds in steps of 20');
   const nat = external ? `external_signaling_address=${external}\nexternal_media_address=${external}\nlocal_net=10.0.0.0/8\nlocal_net=172.16.0.0/12\nlocal_net=192.168.0.0/16\n` : '';
   return {
     'pjsip.conf': `[transport-tcp]
@@ -107,9 +109,11 @@ writeprotect=yes
 exten => _.,1,Hangup()
 
 [gpt-incoming]
-exten => _X.,1,Stasis(${app},incoming)
+exten => _X.,1,Set(JITTERBUFFER(fixed)=${jitterBufferMs})
+ same => n,Stasis(${app},incoming)
  same => n,Hangup()
-exten => s,1,Stasis(${app},incoming)
+exten => s,1,Set(JITTERBUFFER(fixed)=${jitterBufferMs})
+ same => n,Stasis(${app},incoming)
  same => n,Hangup()
 
 [gpt-outbound]
@@ -118,7 +122,8 @@ ${providerReady ? `exten => _+7XXXXXXXXXX,1,Set(CALLERID(num)=${caller})
  same => n,Hangup()
 
 [gpt-charge]
-exten => s,1,Set(PJSIP_HEADER(add,P-Charge-Info)=<sip:${caller.slice(1)}@voice.plusofon.ru>)
+exten => s,1,Set(JITTERBUFFER(fixed)=${jitterBufferMs})
+ same => n,Set(PJSIP_HEADER(add,P-Charge-Info)=<sip:${caller.slice(1)}@voice.plusofon.ru>)
  same => n,Return()
 ` : 'exten => _.,1,Hangup(21)\n'}
 

@@ -2,11 +2,12 @@ import {EventEmitter} from 'node:events';
 import {randomUUID} from 'node:crypto';
 import {realpath,stat} from 'node:fs/promises';
 import {basename,dirname,resolve} from 'node:path';
-import {spawn} from 'node:child_process';
+import {spawn,type ChildProcess} from 'node:child_process';
 import {AsteriskGateway} from './asterisk.js';
 import {LiveSession, type FinalUsage} from './live.js';
 import {CallStore, addTranscript, transcriptText} from './store.js';
 import {getOwnNumber} from './plusofon.js';
+import {wavDuration} from './wav.js';
 import {liveIssues, normalizeNumber, safeError, safeText} from './config.js';
 import type {AppConfig, CallRecord, Check, ConsoleController, Mode, PhoneLeg, Snapshot, TranscriptEntry} from './types.js';
 
@@ -46,7 +47,10 @@ export class PhoneController implements ConsoleController {
   private gateway?:Gateway;
   private connecting?:Promise<void>;
   private shuttingDown=false;
-  constructor(private config:AppConfig,private options:{gatewayFactory?:()=>Gateway;liveFactory?:(task:string)=>Voice;demoIntervalMs?:number}={}) {
+  private deletingHistory=false;
+  private player?:{id:string;child:ChildProcess;closed:Promise<void>;stopped:boolean;position:number};
+  private playbackRevision=0;
+  constructor(private config:AppConfig,private options:{gatewayFactory?:()=>Gateway;liveFactory?:(task:string,context:Pick<CallRecord,'direction'|'number'>)=>Voice;demoIntervalMs?:number;playerFactory?:(file:string,position:number)=>ChildProcess}={}) {
     this.store=new CallStore(config.callsDir);
     this.state={mode:config.mode,gatewayStatus:'disabled',configIssues:config.mode==='live'?liveIssues(config):[],history:[],notice:'Готово. Демо работает без ключей и реальных звонков.',ownNumber:config.gateway.callerNumber||undefined,ownNumberSource:'config'};
   }
@@ -108,17 +112,19 @@ export class PhoneController implements ConsoleController {
     this.active=call;this.publish({notice:direction==='demo'?'Локальная имитация: никто не получает звонок.':'Подготовка звонка…'});
     return call;
   }
-  async startCall(input:string,task:string):Promise<void> {
+  async startCall(input:string,task=''):Promise<void> {
     if(this.shuttingDown)throw new Error('Программа завершает работу.');
+    if(this.deletingHistory)throw new Error('Дождитесь удаления истории.');
     if(running(this.active?.record))throw new Error('Звонок уже выполняется.');
     const number=normalizeNumber(input);
-    if(!task.trim()||task.length>8000)throw new Error('Задача: от 1 до 8000 символов.');
+    if(task.length>8000)throw new Error('Задача: не более 8000 символов.');
     if(this.config.allowedNumbers.length && !this.config.allowedNumbers.includes(number))throw new Error('Номер отсутствует в ALLOWED_NUMBERS.');
     if(this.state.mode==='live'){
       const issues=liveIssues(this.config);if(issues.length)throw new Error(issues.join(' '));
     }
-    const call=this.createCall(number,task,this.state.mode==='demo'?'demo':'outbound');
+    const call=this.createCall(number,task.trim()||'Поболтай с собеседником в заданной манере и помогай с его вопросами.',this.state.mode==='demo'?'demo':'outbound');
     try {
+      await this.stopRecording();
       call.record.savedPath=await this.store.save(call.record);
       if(call.ended||call.abort.signal.aborted)return;
       if(this.state.mode==='demo'){this.demo(call);return;}
@@ -133,23 +139,24 @@ export class PhoneController implements ConsoleController {
     } catch(error){if(!call.abort.signal.aborted)await this.finish(call,this.message(error));}
   }
   private async receive(leg:PhoneLeg,input:string):Promise<void> {
-    if(this.shuttingDown||running(this.active?.record)){await leg.close();return;}
+    if(this.shuttingDown||this.deletingHistory||running(this.active?.record)){await leg.close();return;}
     const number=safeText(input).slice(0,80);
     if(this.config.allowedNumbers.length){let normalized='';try{normalized=normalizeNumber(number);}catch{}if(!this.config.allowedNumbers.includes(normalized)){await leg.close();return;}}
-    const call=this.createCall(number,'Ответь на входящий звонок как голосовой помощник. Помогай с вопросами и поиском информации.','inbound');
+    const call=this.createCall(number,'Поддержи разговор в заданной манере жёсткой дружеской прожарки: грубо шути, используй разнообразный русский мат, подкалывай собеседника и помогай с его вопросами и поиском информации. При явной просьбе прекратить стёб продолжай обычным уважительным тоном.','inbound');
     call.leg=leg;
-    try{call.record.savedPath=await this.store.save(call.record);if(!call.ended)await this.startVoice(call);}
+    try{await this.stopRecording();call.record.savedPath=await this.store.save(call.record);if(!call.ended)await this.startVoice(call);}
     catch(error){await this.finish(call,this.message(error));}
   }
   private async startVoice(call:ActiveCall):Promise<void> {
-    const live=this.options.liveFactory?.(call.record.task)||new LiveSession(this.config,call.record.task);
+    const context={direction:call.record.direction,number:call.record.number};
+    const live=this.options.liveFactory?.(call.record.task,context)||new LiveSession(this.config,call.record.task,{call:context});
     call.live=live;
     live.on('transcript',(fragment:TranscriptEntry)=>{if(!call.record.endedAt)this.fragment(call,fragment);});
     live.on('audio',(audio:Buffer)=>{
       if(call.ended||call.abort.signal.aborted)return;
       try{call.leg?.sendAudio(audio);}catch(error){void this.finish(call,this.message(error)).catch(e=>this.report(e));}
     });
-    live.on('notice',(notice:string)=>this.publish({notice:safeText(notice)}));
+    live.on('notice',(notice:string)=>{if(!call.ended&&!call.endRequested)this.publish({notice:safeText(notice)});});
     live.on('diagnostic',(detail:string)=>{
       call.record.diagnostics=[...(call.record.diagnostics??[]).slice(-99),`${new Date().toISOString()} ${this.message(detail)}`];
       void this.store.save(call.record).catch(error=>this.report(error));
@@ -173,7 +180,7 @@ export class PhoneController implements ConsoleController {
     call.record.recordingPath=call.leg!.recordingPath;
     call.record.status='active';this.publish({notice:'Разговор идёт. Реплики сохраняются локально.'});
     live.startConversation();
-    this.schedule(call,()=>{void this.finish(call).catch(error=>this.report(error));},this.config.maxCallSeconds*1000);
+    if(this.config.maxCallSeconds>0)this.schedule(call,()=>{call.record.hangupReason='duration_limit';void this.finish(call).catch(error=>this.report(error));},this.config.maxCallSeconds*1000);
   }
   private schedule(call:ActiveCall,action:()=>void,ms:number):ReturnType<typeof setTimeout> {
     const timer=setTimeout(()=>{call.timers.delete(timer);if(!call.ended)action();},ms);call.timers.add(timer);
@@ -181,11 +188,11 @@ export class PhoneController implements ConsoleController {
   }
   private demo(call:ActiveCall):void {
     const lines:[TranscriptEntry['role'],string][]=[
-      ['agent','Привет! Я ИИ-помощник. Сейчас идёт демонстрация интерфейса.'],
+      ['agent','О, блядь, кто на связи! Ну что, гений, какую хрень сегодня обсуждаем?'],
       ['human','Привет! Расскажи, что ты умеешь.'],
-      ['agent','Могу говорить по телефону, искать актуальную информацию и сохранять наш разговор с разделением по ролям.'],
+      ['agent','Могу болтать, искать новости и сохранять разговор. Охуеть какой прогресс: теперь даже твои гениальные идеи не потеряются.'],
       ['human','Отлично, пришли текст после звонка.'],
-      ['agent','Готово. Транскрипт появится в журнале и в папке calls.'],
+      ['agent','Записано, чёрт побери. Транскрипт будет в журнале и папке calls — потом перечитаешь свои шедевры.'],
     ];
     call.record.status='active';this.publish();
     const interval=this.options.demoIntervalMs??1400;
@@ -224,7 +231,9 @@ export class PhoneController implements ConsoleController {
       if(errors.length)call.record.error=errors.join(' ');
       try{call.record.savedPath=await this.store.save(call.record);}catch(e){call.record.status='failed';call.record.error=`Не удалось сохранить файлы: ${this.message(e)}`;}
       const history=[structuredClone(call.record),...this.state.history.filter(r=>r.id!==call.record.id)];
-      this.publish({history,notice:call.record.error||`Звонок завершён. Транскрипт: ${call.record.savedPath}`});
+      const reason=call.record.hangupReason==='caller_goodbye'?'собеседник попрощался':call.record.hangupReason==='caller_requested_hangup'?'собеседник попросил закончить разговор':'';
+      const notice=call.record.hangupReason==='duration_limit'?`Звонок завершён по лимиту ${this.config.maxCallSeconds} секунд.`:`Звонок завершён${reason?`: ${reason}`:''}. Транскрипт: ${call.record.savedPath}`;
+      this.publish({history,notice:call.record.error||notice});
     })();
     return call.ending;
   }
@@ -250,16 +259,89 @@ export class PhoneController implements ConsoleController {
   private saved(id:string):CallRecord {
     const record=this.state.history.find(r=>r.id===id);if(!record)throw new Error('Звонок не найден в журнале.');return structuredClone(record);
   }
-  async playRecording(id:string):Promise<void> {
+  async deleteHistory(id?:string):Promise<void>{
+    if(running(this.active?.record))throw new Error('Сначала завершите текущий звонок.');
+    if(this.deletingHistory)throw new Error('Удаление истории уже выполняется.');
+    this.deletingHistory=true;
+    try{
+      if(!id||this.state.playback?.id===id)await this.stopRecording();
+      const records=id?[this.saved(id)]:[...this.state.history];
+      for(const record of records){
+        await this.store.remove(record);
+        if(this.active?.record.id===record.id)this.active=undefined;
+        this.publish({history:this.state.history.filter(call=>call.id!==record.id),current:this.state.current?.id===record.id?undefined:this.state.current});
+      }
+      if(!id)await this.store.clearOrphans();
+      this.publish({notice:id?'Звонок, аудио и файлы транскрипта удалены.':`История очищена: удалено звонков — ${records.length}.`});
+    }finally{this.deletingHistory=false;}
+  }
+  async playRecording(id:string,positionSeconds=0):Promise<void> {
+    if(!Number.isFinite(positionSeconds))throw new Error('Некорректная позиция записи.');
+    const revision=++this.playbackRevision;
+    if(running(this.active?.record))throw new Error('Сначала завершите текущий звонок.');
+    if(this.shuttingDown||this.deletingHistory)throw new Error('Дождитесь завершения текущей операции.');
     const record=this.saved(id);
     if(!record.recordingPath)throw new Error('У этого звонка нет аудиозаписи.');
     const candidate=resolve(record.recordingPath),root=resolve('recordings');
     if(dirname(candidate)!==root||!/^[a-f0-9-]{36}\.wav$/i.test(basename(candidate)))throw new Error('Недопустимый путь аудиозаписи.');
     const file=await realpath(candidate);
-    if(dirname(file)!==await realpath(root)||(await stat(file)).size<=44)throw new Error('Аудиозапись отсутствует или имеет недопустимый путь.');
-    const child=spawn(process.platform==='win32'?'explorer.exe':process.platform==='darwin'?'open':'xdg-open',[file],{windowsHide:true,stdio:'ignore',detached:true});
-    await new Promise<void>((ok,fail)=>{child.once('spawn',ok);child.once('error',fail);});child.unref();
-    this.publish({notice:'Аудиозапись открыта в проигрывателе.'});
+    const info=await stat(file);
+    if(dirname(file)!==await realpath(root)||!info.isFile()||info.size<=44)throw new Error('Аудиозапись отсутствует или имеет недопустимый путь.');
+    const durationSeconds=await wavDuration(file,info.size),position=Math.max(0,Math.min(durationSeconds,positionSeconds));
+    if(revision!==this.playbackRevision)return;
+    await this.stopPlayer();
+    if(revision!==this.playbackRevision)return;
+    if(this.shuttingDown||this.deletingHistory||running(this.active?.record))throw new Error('Начался звонок или завершение работы; прослушивание отменено.');
+    const playback={id,positionSeconds:position,durationSeconds,paused:position===durationSeconds};
+    this.publish({playback});if(playback.paused)return;
+    const child=this.options.playerFactory?.(file,position)||spawn('ffplay',['-nodisp','-autoexit','-loglevel','error','-stats','-ss',String(position),'-i',file],{windowsHide:true,stdio:['ignore','ignore','pipe']});
+    let finish!:()=>void,details='',pending='',lastUpdate=0;
+    const closed=new Promise<void>(resolve=>{finish=resolve;}),player={id,child,closed,stopped:false,position};
+    this.player=player;
+    child.stderr?.on('data',chunk=>{
+      const lines=(pending+String(chunk)).split(/[\r\n]/);pending=lines.pop()!.slice(-2000);
+      for(const line of lines){
+        const match=line.match(/^\s*(-?\d+(?:\.\d+)?)\s+M-A:/);
+        if(!match){details=(details+line+'\n').slice(-2000);continue;}
+        if(this.player!==player||player.stopped)continue;
+        player.position=Math.max(position,Math.min(durationSeconds,Number(match[1])));
+        if(Date.now()-lastUpdate>=200){lastUpdate=Date.now();this.publish({playback:{...playback,positionSeconds:player.position}});}
+      }
+    });
+    child.on('error',error=>{details=this.message(error);});
+    child.once('close',code=>{
+      if(this.player===player){
+        this.player=undefined;
+        if(!player.stopped)this.publish({playback:code===0?{...playback,positionSeconds:durationSeconds,paused:true}:undefined,notice:code===0?'Воспроизведение завершено.':`Не удалось воспроизвести запись: ${safeText(details+pending).trim()||'проверьте ffplay из FFmpeg.'}`});
+      }
+      finish();
+    });
+    try{await new Promise<void>((ok,fail)=>{child.once('spawn',ok);child.once('error',fail);});}
+    catch(error){await closed;throw new Error((error as NodeJS.ErrnoException).code==='ENOENT'?'Не найден ffplay. Установите FFmpeg с ffplay и добавьте его в PATH.':this.message(error));}
+    if(this.player===player)this.publish({notice:'Играет аудиозапись.'});
+  }
+  async stopRecording():Promise<void>{
+    ++this.playbackRevision;this.publish({playback:undefined});
+    await this.stopPlayer();
+  }
+  async pauseRecording():Promise<void>{
+    const playback=this.state.playback;if(!playback||playback.paused)return;
+    const positionSeconds=this.player?.position??playback.positionSeconds,revision=++this.playbackRevision;
+    await this.stopPlayer();
+    if(revision===this.playbackRevision)this.publish({playback:{...playback,positionSeconds,paused:true},notice:'Воспроизведение на паузе.'});
+  }
+  async seekRecording(positionSeconds:number):Promise<void>{
+    if(!Number.isFinite(positionSeconds))throw new Error('Некорректная позиция записи.');
+    const playback=this.state.playback;if(!playback)return;
+    const position=Math.max(0,Math.min(playback.durationSeconds,positionSeconds));
+    if(playback.paused){++this.playbackRevision;this.publish({playback:{...playback,positionSeconds:position}});}
+    else await this.playRecording(playback.id,position);
+  }
+  private async stopPlayer():Promise<void>{
+    const player=this.player;if(!player)return;
+    player.stopped=true;player.child.kill();
+    const timer=setTimeout(()=>player.child.kill('SIGKILL'),1500);timer.unref();
+    try{await player.closed;}finally{clearTimeout(timer);}
   }
   async summarize(id:string):Promise<void> {
     const record=this.saved(id);
@@ -293,5 +375,5 @@ export class PhoneController implements ConsoleController {
     }catch(error){checks.push({name:'Asterisk',ok:false,detail:this.message(error)});}
     checks.push({name:'Telegram',ok:!!this.config.telegramToken&&!!this.config.telegramChatId,detail:'Необязателен. Отправка только по команде из журнала.'});return checks;
   }
-  async close():Promise<void>{this.shuttingDown=true;await this.hangup();await this.gateway?.close();await this.store.flush();}
+  async close():Promise<void>{this.shuttingDown=true;await this.stopRecording();await this.hangup();await this.gateway?.close();await this.store.flush();}
 }

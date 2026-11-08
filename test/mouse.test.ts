@@ -29,3 +29,11 @@ test('fragmented wheel reports scroll once, never click or become typed text',()
   assert.equal(typed,'');assert.deepEqual(clicks,[]);assert.deepEqual(scrolls,[[-1,20,12],[1,20,12]]);
   assert.equal(filter.push('\u001b[200~\u001b[<64;20;12M\u001b[201~'),'\u001b[200~\u001b[<64;20;12M\u001b[201~');assert.equal(scrolls.length,2);
 });
+
+test('fragmented left drag and release reports are separate from clicks and pasted text',()=>{
+  const clicks:number[][]=[],drag:unknown[][]=[];
+  const filter=mouseFilter((x,y)=>clicks.push([x,y]),()=>{},(phase,x,y)=>drag.push([phase,x,y]));
+  let typed='';for(const byte of '\u001b[<0;20;10M\u001b[<32;22;15M\u001b[<0;22;15m\u001b[<35;25;20M')typed+=filter.push(byte);
+  assert.equal(typed,'');assert.deepEqual(clicks,[[20,10]]);assert.deepEqual(drag,[['move',22,15],['end',22,15]]);
+  assert.equal(filter.push('\u001b[200~\u001b[<32;22;15M\u001b[201~'),'\u001b[200~\u001b[<32;22;15M\u001b[201~');assert.equal(drag.length,2);
+});

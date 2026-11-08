@@ -18,7 +18,7 @@ npm.cmd run check:gateway
 
 Создаются `pjsip.conf`, `extensions.conf`, `ari.conf`, `http.conf`, `rtp.conf`, `modules.conf`, `chan_websocket.conf` в `runtime/asterisk/`. В них есть пароль ARI и SIP-пароль, поэтому каталог исключён из Git. В Windows режимы Unix `0600` не заменяют настройки доступа NTFS.
 
-Образ Asterisk 23 закреплён digest в `compose.yaml`. Нужны `chan_websocket`, ARI, PJSIP, `codec_resample`, телефонные кодеки alaw/ulaw и `TALK_DETECT`. Аудио между Node.js и АТС — PCM 24 кГц; телефонная часть согласует кодек с оператором. WebSocket использует заголовок Basic-авторизации, медиа-канал — выданный Asterisk идентификатор соединения.
+Образ Asterisk 23 закреплён digest в `compose.yaml`. Нужны `chan_websocket`, ARI, PJSIP, `codec_resample`, телефонные кодеки alaw/ulaw, `TALK_DETECT` и `func_jitterbuffer`. Аудио между Node.js и АТС — PCM 24 кГц; телефонная часть согласует кодек с оператором. Фиксированный `JITTERBUFFER` (по умолчанию 120 мс, `ASTERISK_JITTERBUFFER_MS`) устанавливается на входящей стороне PJSIP до обработки и записи; для исходящего звонка используется обработчик `b(gpt-charge^s^1)` на вызываемом канале. WebSocket использует заголовок Basic-авторизации, медиа-канал — выданный Asterisk идентификатор соединения.
 
 Compose публикует ARI TCP 8088 **только на localhost**, SIP TCP 5060 и RTP UDP 10000–10020. Конфигурация использует TCP для SIP, не UDP. При NAT может потребоваться публичный `ASTERISK_EXTERNAL_ADDRESS`, firewall и проброс RTP. Настройки зависят от сети и оператора.
 

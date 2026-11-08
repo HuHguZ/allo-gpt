@@ -24,8 +24,8 @@ export function normalizeNumber(input: string): string {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const mode = env.PHONE_MODE ?? 'demo';
   if (mode !== 'demo' && mode !== 'live') throw new Error('PHONE_MODE: допустимы demo или live.');
-  const maxCallSeconds = Number(env.MAX_CALL_SECONDS ?? 600);
-  if (!Number.isInteger(maxCallSeconds) || maxCallSeconds < 10 || maxCallSeconds > 3600) throw new Error('MAX_CALL_SECONDS: целое число от 10 до 3600.');
+  const maxCallSeconds = Number(env.MAX_CALL_SECONDS ?? 0);
+  if (!Number.isInteger(maxCallSeconds) || (maxCallSeconds!==0&&maxCallSeconds < 10) || maxCallSeconds > 3600) throw new Error('MAX_CALL_SECONDS: 0 без лимита или целое число от 10 до 3600.');
   const ariUrl = env.ASTERISK_ARI_URL || 'http://127.0.0.1:8088';
   const parsed = new URL(ariUrl);
   if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('ASTERISK_ARI_URL: нужен HTTP(S) адрес без пароля и параметров.');

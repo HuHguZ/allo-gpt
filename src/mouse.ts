@@ -3,10 +3,11 @@ import {measureElement, useStdin, useStdout, type DOMElement} from 'ink';
 import type {Readable} from 'node:stream';
 import type {WriteStream} from 'node:tty';
 
-export type MouseTargets = Map<string, {node: DOMElement; press: () => void}>;
+export type MouseDrag = (phase:'move'|'end',x:number,y:number)=>void;
+export type MouseTargets = Map<string, {node: DOMElement; press: (x:number,y:number) => void;drag?:MouseDrag}>;
 
 // Remove SGR reports before Ink sees them, including reports split across reads.
-export function mouseFilter(press: (x: number, y: number) => void, scroll:(direction:number,x:number,y:number)=>void=()=>{}) {
+export function mouseFilter(press: (x: number, y: number) => void, scroll:(direction:number,x:number,y:number)=>void=()=>{},drag:MouseDrag=()=>{}) {
   const mouse = '\u001b[<';
   const pasteStart = '\u001b[200~';
   const pasteEnd = '\u001b[201~';
@@ -44,8 +45,10 @@ export function mouseFilter(press: (x: number, y: number) => void, scroll:(direc
           const report = /^\u001b\[<(\d+);(\d+);(\d+)([Mm])/.exec(rest);
           if (report) {
             const button = Number(report[1]), x = Number(report[2]), y = Number(report[3]);
-            if(x>0&&y>0&&Number.isSafeInteger(x)&&Number.isSafeInteger(y)&&report[4]==='M'){
-              if(button===0)press(x,y);
+            if(x>0&&y>0&&Number.isSafeInteger(x)&&Number.isSafeInteger(y)){
+              if(report[4]==='m'){if(button<64&&(button&3)===0)drag('end',x,y);}
+              else if(button===0)press(x,y);
+              else if(button===32)drag('move',x,y);
               else if(button===64||button===65)scroll(button===64?-1:1,x,y);
             }
             i += report[0].length;
@@ -86,15 +89,17 @@ export function useMouse(root: RefObject<DOMElement | null>, targets: RefObject<
     const originalRead = input.read;
     let queued = '';
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let draggedId:string|undefined;
     const filter = mouseFilter((x, y) => {
       queueMicrotask(() => {
         if (!root.current || x > output.columns || y > output.rows) return;
         // The CLI uses an alternate screen; overflowing frames scroll off its top.
         const row = y - 1 + Math.max(0, measureElement(root.current).height - (output.rows || 24));
-        for (const {node, press} of targets.current.values()) {
+        draggedId=undefined;
+        for (const [id,{node, press,drag}] of targets.current) {
           const box = measureElement(node);
           if (x - 1 >= box.x && x - 1 < box.x + box.width && row >= box.y && row < box.y + box.height) {
-            press();
+            draggedId=drag?id:undefined;press(x-1,row);
             break;
           }
         }
@@ -102,6 +107,12 @@ export function useMouse(root: RefObject<DOMElement | null>, targets: RefObject<
     },(direction,x,y)=>queueMicrotask(()=>{
       if(!root.current||x>output.columns||y>output.rows)return;
       scroll.current?.(direction,x-1,y-1+Math.max(0,measureElement(root.current).height-(output.rows||24)));
+    }),(phase,x,y)=>queueMicrotask(()=>{
+      if(!root.current||!draggedId)return;
+      const target=targets.current.get(draggedId);
+      if(!target?.drag){draggedId=undefined;return;}
+      target.drag(phase,x-1,y-1+Math.max(0,measureElement(root.current).height-(output.rows||24)));
+      if(phase==='end')draggedId=undefined;
     }));
     const read = (size?: number) => {
       if (queued) {const value = queued; queued = ''; return value;}
@@ -118,11 +129,11 @@ export function useMouse(root: RefObject<DOMElement | null>, targets: RefObject<
       return value;
     };
     input.read = read;
-    output.write('\u001b[?1000h\u001b[?1006h');
+    output.write('\u001b[?1002h\u001b[?1006h');
     return () => {
       clearTimeout(timer);
       if (input.read === read) input.read = originalRead;
-      if (!output.destroyed && !output.writableEnded) output.write('\u001b[?1000l\u001b[?1006l');
+      if (!output.destroyed && !output.writableEnded) output.write('\u001b[?1002l\u001b[?1006l');
     };
   }, [enabled, stdin, stdout, root, targets]);
 }

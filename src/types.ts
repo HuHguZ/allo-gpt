@@ -27,6 +27,7 @@ export interface CallRecord {
   hangupReason?:string;
 }
 export interface Check {name: string; ok: boolean; detail: string}
+export interface RecordingPlayback {id:string;positionSeconds:number;durationSeconds:number;paused:boolean}
 export interface Snapshot {
   mode: Mode;
   gatewayStatus: 'disabled' | 'connecting' | 'ready' | 'error';
@@ -34,6 +35,7 @@ export interface Snapshot {
   current?: CallRecord;
   history: CallRecord[];
   notice: string;
+  playback?:RecordingPlayback;
   ownNumber?:string;
   ownNumberSource?:'config'|'api';
   ownNumberError?:string;
@@ -42,12 +44,16 @@ export interface ConsoleController {
   getSnapshot(): Snapshot;
   subscribe(listener: () => void): () => void;
   setMode(mode: Mode): Promise<void>;
-  startCall(number: string, task: string): Promise<void>;
+  startCall(number: string, task?: string): Promise<void>;
   hangup(): Promise<void>;
   sendInstruction(text: string): Promise<void>;
   summarize(id: string): Promise<void>;
   sendTranscript(id: string): Promise<void>;
-  playRecording(id: string): Promise<void>;
+  playRecording(id: string,positionSeconds?:number): Promise<void>;
+  pauseRecording():Promise<void>;
+  seekRecording(positionSeconds:number):Promise<void>;
+  stopRecording():Promise<void>;
+  deleteHistory(id?:string):Promise<void>;
   copyOwnNumber():Promise<void>;
   refreshOwnNumber():Promise<void>;
   doctor(): Promise<Check[]>;

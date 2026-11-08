@@ -22,7 +22,7 @@ const screen = (ui: Rendered) => ui.frames.findLast(frame => frame.includes('GPT
 function point(ui: Rendered, label: string) {
   const lines = screen(ui).split('\n');
   const y = lines.findIndex(line => line.includes(label));
-  assert.ok(y >= 0, `Visible mouse target: ${label}`);
+  assert.ok(y >= 0, `Visible mouse target: ${label}\n${screen(ui)}`);
   return {x: lines[y]!.indexOf(label) + 1, y: y + 1};
 }
 async function click(ui: Rendered, label: string) {
@@ -60,7 +60,11 @@ function fakeController(initial: Partial<Snapshot> = {}) {
     sendInstruction: async value => {actions.push(['instruction', value]);},
     summarize: async id => {actions.push(['summary', id]);},
     sendTranscript: async id => {actions.push(['transcript', id]);},
-    playRecording: async id => {actions.push(['recording', id]);},
+    playRecording: async (id,position=0) => {actions.push(['recording', id,position]);publish({playback:{id,positionSeconds:position,durationSeconds:120,paused:false}});},
+    pauseRecording:async()=>{actions.push(['pause-recording']);if(snapshot.playback)publish({playback:{...snapshot.playback,paused:true}});},
+    seekRecording:async position=>{actions.push(['seek-recording',position]);if(snapshot.playback)publish({playback:{...snapshot.playback,positionSeconds:Math.max(0,Math.min(120,position))}});},
+    stopRecording:async()=>{actions.push(['stop-recording']);publish({playback:undefined});},
+    deleteHistory:async id=>{actions.push(['delete-history',id]);publish({history:id?snapshot.history.filter(call=>call.id!==id):[],current:!id||snapshot.current?.id===id?undefined:snapshot.current});},
     copyOwnNumber:async()=>{actions.push(['copy-number']);},
     refreshOwnNumber:async()=>{actions.push(['refresh-number']);},
     doctor: async () => [{name: 'Телефония', ok: false, detail: 'Транк не настроен'}],
@@ -68,6 +72,40 @@ function fakeController(initial: Partial<Snapshot> = {}) {
   };
   return {controller, actions, publish};
 }
+
+test('a number alone enables calling without a task',async()=>{
+  const {controller,actions}=fakeController();const ui=await mouseConsole(controller);
+  try{
+    ui.stdin.write('+70000000000');await delay(30);await click(ui,'ПОЗВОНИТЬ');
+    assert.deepEqual(actions,[['start','+70000000000','']]);
+  }finally{ui.unmount();}
+});
+
+for(const columns of [110,56])test(`history deletion uses a modal, defaults to cancel and requires explicit mouse or keyboard confirmation at ${columns} columns`,async()=>{
+  const {controller,actions}=fakeController({history:[record,{...record,id:'call-2',number:'+70000000001'}]});
+  const ui=await mouseConsole(controller,columns,38);
+  try{
+    await click(ui,'3 ИСТОРИЯ');await click(ui,'УДАЛИТЬ ЗВОНОК');
+    assert.match(screen(ui),/WAV.*JSON/u);assert.deepEqual(actions,[]);
+    ui.stdin.write('\r');await delay(30);assert.deepEqual(actions,[]);assert.doesNotMatch(screen(ui),/УДАЛИТЬ НАВСЕГДА/);
+    await click(ui,'УДАЛИТЬ ЗВОНОК');await click(ui,'УДАЛИТЬ НАВСЕГДА');
+    assert.deepEqual(actions,[['delete-history','call-1']]);assert.match(screen(ui),/ИСТОРИЯ · 1/);
+    await click(ui,'ОЧИСТИТЬ ИСТОРИЮ');ui.stdin.write('\u001b');
+    for(let i=0;i<20&&screen(ui).includes('УДАЛИТЬ НАВСЕГДА');i++)await delay(10);
+    assert.doesNotMatch(screen(ui),/УДАЛИТЬ НАВСЕГДА/);assert.equal(actions.length,1);
+    await click(ui,'ОЧИСТИТЬ ИСТОРИЮ');ui.stdin.write('\t');await delay(30);ui.stdin.write('\r');await delay(40);
+    assert.deepEqual(actions,[['delete-history','call-1'],['delete-history',undefined]]);assert.match(screen(ui),/ИСТОРИЯ · 0/);
+  }finally{ui.unmount();}
+});
+
+test('a new incoming call dismisses deletion confirmation without deleting anything',async()=>{
+  const {controller,actions,publish}=fakeController({history:[record]});const ui=await mouseConsole(controller,110,38);
+  try{
+    await click(ui,'3 ИСТОРИЯ');await click(ui,'ОЧИСТИТЬ ИСТОРИЮ');
+    publish({current:{...record,id:'active-call',status:'active'}});await delay(40);
+    assert.doesNotMatch(screen(ui),/УДАЛИТЬ НАВСЕГДА/);assert.deepEqual(actions,[]);
+  }finally{ui.unmount();}
+});
 
 test('editing number and task never runs command hotkeys; focused call button starts once', async () => {
   const {controller, actions} = fakeController();
@@ -133,11 +171,45 @@ test('command mode displays diagnostics and switches live/demo without dialling'
   ui.unmount();
 });
 
-test('completed recording opens only after its explicit mouse or keyboard command', async()=>{
+test('recording modal pauses, seeks by keys and timeline, blocks background and closes with Escape', async()=>{
   const {controller,actions}=fakeController({history:[{...record,recordingPath:'C:/recordings/test.wav'}]});
-  const ui=await mouseConsole(controller);await click(ui,'3 ИСТОРИЯ');
-  assert.deepEqual(actions,[]);await click(ui,'a ЗАПИСЬ');assert.deepEqual(actions,[['recording','call-1']]);
-  ui.stdin.write('\u001b');await delay(20);ui.stdin.write('a');await delay(30);assert.deepEqual(actions,[['recording','call-1'],['recording','call-1']]);ui.unmount();
+  const ui=await mouseConsole(controller);await click(ui,'3 ИСТОРИЯ');const background=point(ui,'1 НОВЫЙ');
+  try{
+    assert.deepEqual(actions,[]);await click(ui,'a СЛУШАТЬ');assert.deepEqual(actions,[['recording','call-1',0]]);assert.match(screen(ui),/GPT-LIVE \/ ПЛЕЕР/);assert.match(screen(ui),/0:00 \/ 2:00/);
+    ui.stdin.write(`\u001b[<0;${background.x};${background.y}M`);await delay(25);assert.deepEqual(actions,[['recording','call-1',0]]);
+    ui.stdin.write(' ');await delay(25);assert.match(screen(ui),/ПРОДОЛЖИТЬ/);ui.stdin.write('\u001b[C');await delay(25);assert.match(screen(ui),/0:10 \/ 2:00/);
+    const line=screen(ui).split('\n').findIndex(row=>/[●━─]{8}/u.test(row));assert.ok(line>=0);const row=screen(ui).split('\n')[line]!;const first=row.search(/[●━─]/u),last=Math.max(row.lastIndexOf('─'),row.lastIndexOf('━'),row.lastIndexOf('●'));
+    ui.stdin.write(`\u001b[<0;${last+1};${line+1}M`);await delay(30);assert.match(screen(ui),/2:00 \/ 2:00/);
+    ui.stdin.write('\u001b[H');await delay(25);assert.match(screen(ui),/0:00 \/ 2:00/);await click(ui,'ПРОДОЛЖИТЬ');assert.deepEqual(actions.at(-1),['recording','call-1',0]);
+    ui.stdin.write('\u001b');await delay(45);assert.deepEqual(actions.at(-1),['stop-recording']);assert.doesNotMatch(screen(ui),/GPT-LIVE \/ ПЛЕЕР/);assert.ok(first>=0);
+  }finally{ui.unmount();}
+});
+
+for(const columns of [56,100])test(`recording modal stays in place during seeking, pause and errors at ${columns} columns`,async()=>{
+  const {controller}=fakeController({history:[{...record,recordingPath:'C:/recordings/test.wav'}]});
+  let finishSeek!:()=>void;const seek=controller.seekRecording;
+  controller.seekRecording=async position=>{await new Promise<void>(resolve=>{finishSeek=resolve;});await seek(position);};
+  const ui=await mouseConsole(controller,columns,30);
+  const geometry=()=>{
+    const lines=screen(ui).split('\n');const top=lines.findIndex(line=>line.includes('╔')),bottom=lines.findIndex(line=>line.includes('╚'));
+    assert.ok(top>=0&&bottom>top);return {top,bottom,left:lines[top]!.indexOf('╔'),forward:point(ui,'+10 сек')};
+  };
+  try{
+    await click(ui,'3 ИСТОРИЯ');await click(ui,'a СЛУШАТЬ');const before=geometry();
+    await click(ui,'+10 сек');assert.match(screen(ui),/Перематываем/);assert.deepEqual(geometry(),before);
+    finishSeek();await delay(35);assert.deepEqual(geometry(),before);assert.match(screen(ui),/0:10 \/ 2:00/);
+    await click(ui,'ПАУЗА');assert.match(screen(ui),/ПРОДОЛЖИТЬ/);assert.deepEqual(geometry(),before);
+    controller.seekRecording=async()=>{throw new Error('Не удалось перемотать запись. '.repeat(12));};
+    await click(ui,'+10 сек');assert.match(screen(ui),/Не удалось перемотать/);assert.deepEqual(geometry(),before);
+  }finally{finishSeek?.();await delay(25);ui.unmount();}
+});
+
+test('audio can be stopped while a summary is still pending',async()=>{
+  const {controller,actions}=fakeController({history:[record],playback:{id:record.id,positionSeconds:0,durationSeconds:120,paused:false}});
+  let finish!:()=>void;controller.summarize=()=>new Promise<void>(resolve=>{finish=resolve;});
+  const ui=await mouseConsole(controller,110,38);
+  try{await click(ui,'3 ИСТОРИЯ');await click(ui,'s ИТОГ');await click(ui,'■ СТОП');assert.deepEqual(actions,[['stop-recording']]);}
+  finally{finish?.();await delay(25);ui.unmount();}
 });
 
 test('an active call receives typed steering only after the send button and hangup stays explicit', async () => {
@@ -260,7 +332,7 @@ test('mouse tabs and history rows select measured targets and reporting is resto
   const second = {...record, id: 'call-2', number: '+79991111111', task: 'Вторая задача'};
   const {controller, actions} = fakeController({history: [record, second]});
   const ui = await mouseConsole(controller);
-  assert.ok(ui.frames.join('').includes('\u001b[?1000h\u001b[?1006h'));
+  assert.ok(ui.frames.join('').includes('\u001b[?1002h\u001b[?1006h'));
   await click(ui, '3 ИСТОРИЯ');
   assert.match(screen(ui), /Доставка подтверждена/);
   await click(ui, '+79991111111');
@@ -272,13 +344,13 @@ test('mouse tabs and history rows select measured targets and reporting is resto
   assert.deepEqual(actions, [['summary', 'call-2'], ['transcript', 'call-2']]);
   ui.unmount();
   await delay(20);
-  assert.ok(ui.frames.join('').includes('\u001b[?1000l\u001b[?1006l'));
+  assert.ok(ui.frames.join('').includes('\u001b[?1002l\u001b[?1006l'));
 });
 
 for (const columns of [100, 56]) test(`mouse focuses fields and only the actual call button dials at ${columns} columns`, async () => {
   const {controller, actions} = fakeController();
   const ui = await mouseConsole(controller, columns);
-  await click(ui, 'Что узнать');
+  await click(ui, 'Можно оставить');
   ui.stdin.write('Уточни доставку');
   await delay(25);
   await click(ui, '+79991234567');
@@ -308,7 +380,7 @@ test('Escape command navigation still works when mouse input is enabled', async 
 test('mouse coordinates follow the visible bottom of a frame on short terminals', async () => {
   const {controller, actions} = fakeController();
   const ui = await mouseConsole(controller);
-  await click(ui, 'Что узнать');
+  await click(ui, 'Можно оставить');
   ui.stdin.write('Уточни доставку');
   await delay(25);
   await click(ui, '+79991234567');
@@ -379,6 +451,32 @@ test('the vertical scrollbar shows the visible fraction and position and jumps o
     ui.stdin.write('\u001b[1;5H');await delay(40);rows=bar();assert.match(rows[0]!.line,/█/);assert.doesNotMatch(rows.at(-1)!.line,/█/);assert.match(screen(ui),/0%/);
     const last=rows.at(-1)!;const x=Math.max(last.line.lastIndexOf('░'),last.line.lastIndexOf('█'))+1;ui.stdin.write(`\u001b[<0;${x};${last.y+1}M`);await delay(40);assert.match(screen(ui),/SCROLL_059/);assert.match(screen(ui),/100%/);assert.deepEqual(actions,[]);
     ui.stdin.write(`\u001b[<64;${x};${last.y+1}M`);await delay(40);assert.doesNotMatch(screen(ui),/100%/);assert.match(screen(ui),/1 НОВЫЙ/);
+  }finally{ui.unmount();}
+});
+
+test('the whole scrollbar hit area jumps even when clicking its thumb',async()=>{
+  const call={...record,entries:Array.from({length:14},(_,n)=>({role:'agent' as const,text:`CLICK_${String(n).padStart(3,'0')} ${'текст '.repeat(8)}`,startMs:n*1000,endMs:n*1000+900}))};
+  const {controller,actions}=fakeController({current:call});const ui=await mouseConsole(controller,100,30);
+  const bar=()=>screen(ui).split('\n').map((line,y)=>({line,y})).filter(row=>/[░█]/.test(row.line));
+  const press=async(row:{line:string;y:number},padding=false)=>{const x=Math.max(row.line.lastIndexOf('░'),row.line.lastIndexOf('█'))+1-(padding?1:0);ui.stdin.write(`\u001b[<0;${x};${row.y+1}M\u001b[<0;${x};${row.y+1}m`);await delay(40);};
+  try{
+    ui.stdin.write('\u001b[1;5C');await delay(50);assert.match(screen(ui),/100%/);
+    await press(bar()[0]!,true);assert.match(screen(ui),/· 0%/);assert.match(screen(ui),/CLICK_000/);
+    const thumb=bar().filter(row=>row.line.includes('█'));assert.ok(thumb.length>1);await press(thumb[1]!);assert.doesNotMatch(screen(ui),/· 0%/);
+    await press(bar().at(-1)!,true);assert.match(screen(ui),/100%/);assert.match(screen(ui),/CLICK_013/);assert.deepEqual(actions,[]);
+  }finally{ui.unmount();}
+});
+
+test('the scrollbar thumb drags without jumping on grab and releases capture outside its track',async()=>{
+  const call={...record,entries:Array.from({length:30},(_,n)=>({role:'agent' as const,text:`DRAG_${String(n).padStart(3,'0')} ${'текст '.repeat(8)}`,startMs:n*1000,endMs:n*1000+900}))};
+  const {controller,actions}=fakeController({current:call});const ui=await mouseConsole(controller,100,30);
+  const bar=()=>screen(ui).split('\n').map((line,y)=>({line,y})).filter(row=>/[░█]/.test(row.line));
+  try{
+    ui.stdin.write('\u001b[1;5C');await delay(40);ui.stdin.write('\u001b[1;5H');await delay(40);let rows=bar();const x=rows[0]!.line.indexOf('█')+1,grab=rows[1]!.y+1;
+    ui.stdin.write(`\u001b[<0;${x};${grab}M`);await delay(30);assert.match(screen(ui),/· 0%/);
+    const end=rows.at(-1)!.y+1;ui.stdin.write(`\u001b[<32;${x-8};${end}M`);await delay(40);assert.match(screen(ui),/100%/);assert.match(screen(ui),/DRAG_029/);
+    ui.stdin.write(`\u001b[<32;${x-8};${grab}M`);await delay(40);assert.match(screen(ui),/· 0%/);
+    ui.stdin.write(`\u001b[<0;${x-8};${grab}m`);await delay(20);ui.stdin.write(`\u001b[<32;${x};${end}M`);await delay(40);assert.match(screen(ui),/· 0%/);assert.deepEqual(actions,[]);
   }finally{ui.unmount();}
 });
 
